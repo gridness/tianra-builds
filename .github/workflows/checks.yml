@@ -165,6 +165,8 @@ jobs:
 
       - name: Qualify install, update, executable replacement and restart
         run: python3 .github/tools/qualify_native.py
+        env:
+          TIANRA_TEST_PRODUCTION_UPDATER: "1"
 
   admin:
     needs: plan
