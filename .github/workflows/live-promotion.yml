@@ -1,0 +1,52 @@
+name: Live promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      beta_build:
+        description: Successful activated Beta build to promote
+        required: true
+        type: string
+
+concurrency:
+  group: tianra-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: source
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: main
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - run: python3 .github/tools/ci_setup.py butler
+
+      - run: python3 apps/server/tools/release_pipeline.py promote --build "$BETA_BUILD"
+        env:
+          BETA_BUILD: ${{ inputs.beta_build }}
+          ITCH_PUBLISH_TOKEN: ${{ secrets.ITCH_PUBLISH_TOKEN }}
+          TIANRA_SIGNING_KEY: ${{ secrets.TIANRA_SIGNING_KEY }}
+          TIANRA_DB_OWNER_TOKEN: ${{ secrets.TIANRA_DB_OWNER_TOKEN }}
+          TIANRA_RELEASE_PUBLIC_KEY: ${{ vars.TIANRA_RELEASE_PUBLIC_KEY }}
+          TIANRA_OIDC_CLIENT_ID: ${{ vars.TIANRA_OIDC_CLIENT_ID }}

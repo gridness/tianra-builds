@@ -1,0 +1,313 @@
+name: Beta release
+
+on:
+  push:
+    branches: [main]
+    paths: [requests/beta.json]
+# Shared with promotion. Running deployments finish; superseded pending runs may be dropped.
+
+concurrency:
+  group: tianra-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: source
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source: ${{ steps.request.outputs.source }}
+      run_number: ${{ steps.request.outputs.run_number }}
+      native: ${{ steps.plan.outputs.native }}
+      any_native: ${{ steps.plan.outputs.any_native }}
+      any_rust: ${{ steps.plan.outputs.any_rust }}
+      linux: ${{ steps.plan.outputs.linux }}
+      players: ${{ steps.plan.outputs.players }}
+      any_release: ${{ steps.plan.outputs.any_release }}
+      server: ${{ steps.plan.outputs.server }}
+      assets: ${{ steps.plan.outputs.assets }}
+      enabled: ${{ steps.plan.outputs.enabled }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Validate the Beta request
+        id: request
+        working-directory: ${{ github.workspace }}
+        run: python3 .github/tools/request.py read
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ steps.request.outputs.source }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify private main ancestry
+        working-directory: ${{ github.workspace }}
+        env:
+          SOURCE_SHA: ${{ steps.request.outputs.source }}
+        run: python3 .github/tools/request.py verify "$SOURCE_SHA"
+
+      - run: python3 .github/tools/ci.py plan --published --base "$BASE"
+        id: plan
+        env:
+          BASE: ${{ steps.request.outputs.base }}
+          TIANRA_RELEASE_RUN_NUMBER: ${{ steps.request.outputs.run_number }}
+          GH_TOKEN: ${{ github.token }}
+
+      - run: python3 -m unittest discover -s .github/tests -v
+
+      - run: python3 tools/audit_import.py --working-tree
+
+      - run: echo "Publication enabled $ENABLED. Build $BUILD." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          ENABLED: ${{ steps.plan.outputs.enabled }}
+          BUILD: ${{ steps.plan.outputs.build }}
+
+  server:
+    env:
+      TIANRA_RELEASE_RUN_NUMBER: ${{ needs.plan.outputs.run_number }}
+    needs: plan
+    if: needs.plan.outputs.linux == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ needs.plan.outputs.source }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - run: python3 .github/tools/ci_setup.py rust tests
+
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: cache
+        with:
+          path: source/target
+          key: linux-x86_64-wasm-1.99.0-test-release-v4-${{ hashFiles('source/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            linux-x86_64-wasm-1.99.0-test-release-v4-${{ hashFiles('source/Cargo.lock') }}-
+            linux-x86_64-wasm-1.99.0-test-release-v4-
+            linux-x86_64-wasm-1.99.0-test-release-v3-
+            linux-x86_64-wasm-1.99.0-test-release-v2-
+            linux-x86_64-wasm-1.99.0-test-release-
+
+      - run: cargo fmt --all --check
+
+      - run: python3 .github/tools/ci.py test --server "$SERVER" --players "$PLAYERS"
+        env:
+          SERVER: ${{ needs.plan.outputs.server }}
+          PLAYERS: ${{ needs.plan.outputs.players }}
+          TIANRA_CACHE_HIT: ${{ steps.cache.outputs.cache-matched-key != '' }}
+
+      - run: python3 .github/tools/ci.py build server
+        if: needs.plan.outputs.server == 'true'
+        env:
+          TIANRA_BUILD: ${{ needs.plan.outputs.build }}
+          TIANRA_CACHE_HIT: ${{ steps.cache.outputs.cache-matched-key != '' }}
+
+      - run: python3 .github/tools/ci_setup.py spacetime butler
+        if: needs.plan.outputs.server == 'true' && needs.plan.outputs.enabled == 'true'
+
+      - run: python3 apps/server/tools/deploy.py
+        if: needs.plan.outputs.server == 'true' && needs.plan.outputs.enabled == 'true'
+        env:
+          # ASVS 13.3.1/13.3.2: no owner credential reaches cargo or dependencies.
+          TIANRA_DB_OWNER_TOKEN: ${{ secrets.TIANRA_DB_OWNER_TOKEN }}
+          ITCH_PUBLISH_TOKEN: ${{ secrets.ITCH_PUBLISH_TOKEN }}
+          TIANRA_SIGNING_KEY: ${{ secrets.TIANRA_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+
+      - run: python3 "$GITHUB_WORKSPACE/.github/tools/cache.py" --mib 2048 --profile debug
+        id: prune
+        if: always() && !cancelled()
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && !cancelled() && steps.prune.outcome == 'success' && steps.prune.outputs.cache_ready == 'true' && steps.cache.outputs.cache-primary-key != '' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: source/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  native:
+    name: Native (${{ matrix.target }})
+    needs: [plan, server]
+    if: always() && needs.plan.result == 'success' && (needs.server.result == 'success' || needs.server.result == 'skipped') && needs.plan.outputs.any_native == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.native) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      TIANRA_RELEASE_RUN_NUMBER: ${{ needs.plan.outputs.run_number }}
+      TIANRA_TARGET: ${{ matrix.target }}
+      TIANRA_BUILD: ${{ needs.plan.outputs.build }}
+      TIANRA_RELEASE_PUBLIC_KEY: ${{ vars.TIANRA_RELEASE_PUBLIC_KEY }}
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ needs.plan.outputs.source }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - run: python3 .github/tools/ci_setup.py rust native
+
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: cache
+        with:
+          path: source/target
+          key: ${{ matrix.target }}-1.99.0-release-v4-${{ hashFiles('source/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ matrix.target }}-1.99.0-release-v4-${{ hashFiles('source/Cargo.lock') }}-
+            ${{ matrix.target }}-1.99.0-release-v4-
+            ${{ matrix.target }}-1.99.0-release-v3-
+            ${{ matrix.target }}-1.99.0-release-v2-
+            ${{ matrix.target }}-1.99.0-release-
+
+      - run: python3 .github/tools/ci.py build-native --components "$COMPONENTS"
+        env:
+          COMPONENTS: ${{ toJSON(matrix.components) }}
+          TIANRA_CACHE_HIT: ${{ steps.cache.outputs.cache-matched-key != '' }}
+
+      - run: python3 .github/tools/ci_setup.py spacetime
+        if: matrix.launcher && needs.plan.outputs.enabled == 'false'
+
+      - run: python3 .github/tools/qualify_native.py
+        if: matrix.launcher && needs.plan.outputs.enabled == 'false'
+
+      - run: python3 .github/tools/ci_setup.py butler
+        if: (matrix.launcher || matrix.game) && needs.plan.outputs.enabled == 'true'
+
+      - run: python3 apps/server/tools/release_pipeline.py stage launcher --target "$TIANRA_TARGET"
+        if: matrix.launcher && needs.plan.outputs.enabled == 'true'
+        env:
+          ITCH_PUBLISH_TOKEN: ${{ secrets.ITCH_PUBLISH_TOKEN }}
+          TIANRA_SIGNING_KEY: ${{ secrets.TIANRA_SIGNING_KEY }}
+          TIANRA_DB_OWNER_TOKEN: ${{ secrets.TIANRA_DB_OWNER_TOKEN }}
+
+      - run: python3 apps/server/tools/release_pipeline.py stage game --target "$TIANRA_TARGET"
+        if: matrix.game && needs.plan.outputs.enabled == 'true'
+        env:
+          ITCH_PUBLISH_TOKEN: ${{ secrets.ITCH_PUBLISH_TOKEN }}
+          TIANRA_SIGNING_KEY: ${{ secrets.TIANRA_SIGNING_KEY }}
+          TIANRA_DB_OWNER_TOKEN: ${{ secrets.TIANRA_DB_OWNER_TOKEN }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: (matrix.launcher || matrix.game) && needs.plan.outputs.enabled == 'true'
+        with:
+          name: receipts-${{ matrix.target }}
+          path: source/.local/receipts/*.json
+          retention-days: 7
+          include-hidden-files: true
+
+      - run: python3 "$GITHUB_WORKSPACE/.github/tools/cache.py" --mib 2048 --profile release
+        id: prune
+        if: always() && !cancelled()
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && !cancelled() && steps.prune.outcome == 'success' && steps.prune.outputs.cache_ready == 'true' && steps.cache.outputs.cache-primary-key != '' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: source/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  assets:
+    env:
+      TIANRA_RELEASE_RUN_NUMBER: ${{ needs.plan.outputs.run_number }}
+    needs: [plan, server]
+    if: always() && needs.plan.result == 'success' && (needs.server.result == 'success' || needs.server.result == 'skipped') && needs.plan.outputs.assets == 'true' && needs.plan.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ needs.plan.outputs.source }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - run: python3 .github/tools/ci_setup.py butler
+
+      - run: python3 apps/server/tools/release_pipeline.py assets
+        env:
+          TIANRA_RELEASE_PUBLIC_KEY: ${{ vars.TIANRA_RELEASE_PUBLIC_KEY }}
+          TIANRA_OIDC_CLIENT_ID: ${{ vars.TIANRA_OIDC_CLIENT_ID }}
+          ITCH_PUBLISH_TOKEN: ${{ secrets.ITCH_PUBLISH_TOKEN }}
+          TIANRA_SIGNING_KEY: ${{ secrets.TIANRA_SIGNING_KEY }}
+          TIANRA_DB_OWNER_TOKEN: ${{ secrets.TIANRA_DB_OWNER_TOKEN }}
+
+  activate:
+    env:
+      TIANRA_RELEASE_RUN_NUMBER: ${{ needs.plan.outputs.run_number }}
+    needs: [plan, server, native, assets]
+    if: always() && needs.plan.result == 'success' && (needs.server.result == 'success' || needs.server.result == 'skipped') && (needs.native.result == 'success' || needs.native.result == 'skipped') && (needs.assets.result == 'success' || needs.assets.result == 'skipped') && needs.plan.outputs.enabled == 'true' && needs.plan.outputs.any_release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ needs.plan.outputs.source }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - run: python3 .github/tools/ci_setup.py butler
+
+      - run: python3 apps/server/tools/release_pipeline.py assemble
+        env:
+          ITCH_PUBLISH_TOKEN: ${{ secrets.ITCH_PUBLISH_TOKEN }}
+          TIANRA_SIGNING_KEY: ${{ secrets.TIANRA_SIGNING_KEY }}
+          TIANRA_DB_OWNER_TOKEN: ${{ secrets.TIANRA_DB_OWNER_TOKEN }}
+          TIANRA_RELEASE_PUBLIC_KEY: ${{ vars.TIANRA_RELEASE_PUBLIC_KEY }}
+          TIANRA_OIDC_CLIENT_ID: ${{ vars.TIANRA_OIDC_CLIENT_ID }}

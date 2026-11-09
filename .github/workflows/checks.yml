@@ -1,0 +1,174 @@
+name: Checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full private source commit to check
+        required: true
+        type: string
+      base_sha:
+        description: Full private comparison commit, empty for all components
+        required: false
+        type: string
+
+concurrency:
+  group: checks-${{ inputs.source_sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: source
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      rust: ${{ steps.plan.outputs.linux }}
+      launcher: ${{ steps.plan.outputs.launcher }}
+      game: ${{ steps.plan.outputs.game }}
+      players: ${{ steps.plan.outputs.players }}
+      server: ${{ steps.plan.outputs.server }}
+      admin: ${{ steps.plan.outputs.admin }}
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ inputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - run: python3 .github/tools/ci.py plan --base "$BASE"
+        id: plan
+        env:
+          BASE: ${{ inputs.base_sha }}
+
+      - run: python3 -m unittest discover -s .github/tests -v
+
+      - run: python3 tools/audit_import.py --working-tree
+
+  linux:
+    needs: plan
+    if: needs.plan.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ inputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - run: python3 .github/tools/ci_setup.py rust "$DEPENDENCIES"
+        env:
+          DEPENDENCIES: ${{ needs.plan.outputs.players == 'true' && 'native' || 'tests' }}
+
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: cache
+        with:
+          path: source/target
+          key: linux-x86_64-wasm-1.99.0-test-release-v4-${{ hashFiles('source/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            linux-x86_64-wasm-1.99.0-test-release-v4-${{ hashFiles('source/Cargo.lock') }}-
+            linux-x86_64-wasm-1.99.0-test-release-v4-
+            linux-x86_64-wasm-1.99.0-test-release-v3-
+            linux-x86_64-wasm-1.99.0-test-release-v2-
+            linux-x86_64-wasm-1.99.0-test-release-
+
+      - run: cargo fmt --all --check
+
+      - run: python3 .github/tools/ci.py test --server "$SERVER" --players "$PLAYERS"
+        env:
+          SERVER: ${{ needs.plan.outputs.server }}
+          PLAYERS: ${{ needs.plan.outputs.players }}
+          TIANRA_CACHE_HIT: ${{ steps.cache.outputs.cache-matched-key != '' }}
+
+      - run: cargo check --locked -p tianra-game
+        if: needs.plan.outputs.game == 'true'
+
+      - run: cargo check --locked -p tianra-launcher
+        if: needs.plan.outputs.launcher == 'true'
+
+      - run: python3 "$GITHUB_WORKSPACE/.github/tools/cache.py" --mib 2048 --profile debug
+        id: prune
+        if: always() && !cancelled()
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && !cancelled() && steps.prune.outcome == 'success' && steps.prune.outputs.cache_ready == 'true' && steps.cache.outputs.cache-primary-key != '' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: source/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - run: echo "Linux checks dependency cache $CACHE_HIT" >> "$GITHUB_STEP_SUMMARY"
+        if: always() && !cancelled()
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-matched-key != '' }}
+
+  admin:
+    needs: plan
+    if: needs.plan.outputs.admin == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ inputs.source_sha }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - run: python3 .github/tools/ci_setup.py rust native
+
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: cache
+        with:
+          path: source/target
+          key: macos-aarch64-1.99.0-check-v3-${{ hashFiles('source/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            macos-aarch64-1.99.0-check-v3-${{ hashFiles('source/Cargo.lock') }}-
+            macos-aarch64-1.99.0-check-v3-
+            macos-aarch64-1.99.0-check-
+
+      - run: cargo check --locked -p tianra-admin
+
+      - run: python3 "$GITHUB_WORKSPACE/.github/tools/cache.py"
+        id: prune
+        if: always() && !cancelled()
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && !cancelled() && steps.prune.outcome == 'success' && steps.prune.outputs.cache_ready == 'true' && steps.cache.outputs.cache-primary-key != '' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: source/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
