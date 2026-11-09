@@ -284,7 +284,7 @@ jobs:
       TIANRA_RELEASE_RUN_NUMBER: ${{ needs.plan.outputs.run_number }}
     needs: [plan, server, native, assets]
     if: always() && needs.plan.result == 'success' && (needs.server.result == 'success' || needs.server.result == 'skipped') && (needs.native.result == 'success' || needs.native.result == 'skipped') && (needs.assets.result == 'success' || needs.assets.result == 'skipped') && needs.plan.outputs.enabled == 'true' && needs.plan.outputs.any_release == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - name: Check out build orchestration
@@ -301,6 +301,9 @@ jobs:
           ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify native installer packaging
+        run: python3 -m unittest discover -s .github/tests -p test_launcher_package.py -v
 
       - run: python3 .github/tools/ci_setup.py butler
 

@@ -19,6 +19,9 @@ with the same release number. Failed public runs can also be retried directly.
 `Checks` runs manually in the public repo against a selected private commit.
 `Live promotion` remains manual there and accepts an activated Beta build.
 Both production workflows share the public `tianra-production` concurrency group.
+Beta activation and Live promotion assemble and verify first-install downloads on
+the existing `macos-15` runner, using its built-in `hdiutil` for macOS DMGs.
+Windows and Linux receive portable ZIPs with their launcher configuration.
 
 The public repo stores a read-only source deploy key, the existing encrypted
 publication secrets and public configuration variables. Rotate deploy keys by

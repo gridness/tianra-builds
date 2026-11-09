@@ -27,7 +27,7 @@ env:
 jobs:
   promote:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Check out private source
@@ -39,6 +39,9 @@ jobs:
           ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify native installer packaging
+        run: python3 -m unittest discover -s .github/tests -p test_launcher_package.py -v
 
       - run: python3 .github/tools/ci_setup.py butler
 
