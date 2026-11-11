@@ -130,6 +130,7 @@ jobs:
       - name: Build only Admin
         run: python3 .github/tools/ci.py build admin
         env:
+          TIANRA_RELEASE_PUBLIC_KEY: ${{ vars.TIANRA_RELEASE_PUBLIC_KEY }}
           TIANRA_CACHE_HIT: ${{ steps.cache.outputs.cache-matched-key != '' }}
 
       - name: Verify native DMG packaging

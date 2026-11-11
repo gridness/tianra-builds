@@ -1,0 +1,64 @@
+name: Game Master media publication
+run-name: Game Master media ${{ inputs.publication }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      publication:
+        description: Frozen Maincloud publication job ID
+        required: true
+        type: string
+
+# The Owner approved the existing executor boundary on 2026-11-11. Activation
+# still requires the reviewed workflow/source pins. No caller-selected code runs.
+concurrency:
+  group: tianra-content-media-publication
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'gridness/tianra-builds' &&
+      github.ref == 'refs/tags/game-master-media-v1' &&
+      github.run_attempt == 1 &&
+      vars.TIANRA_GM_MEDIA_EXECUTOR_APPROVED == 'true' &&
+      github.workflow_sha == vars.TIANRA_GM_MEDIA_WORKFLOW_SHA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Validate the fixed publication request
+        env:
+          PUBLICATION: ${{ inputs.publication }}
+          SOURCE_REVISION: ${{ vars.TIANRA_GM_PUBLISHER_SOURCE }}
+        run: |
+          [[ "$PUBLICATION" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$SOURCE_REVISION" =~ ^[a-f0-9]{40}$ ]]
+
+      - name: Check out the approved private publisher
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ vars.TIANRA_GM_PUBLISHER_SOURCE }}
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - name: Provision the pinned existing Butler tool
+        run: python3 .github/tools/ci_setup.py butler
+
+      - name: Publish and independently verify frozen media
+        env:
+          PUBLICATION: ${{ inputs.publication }}
+          SOURCE_REVISION: ${{ vars.TIANRA_GM_PUBLISHER_SOURCE }}
+          TIANRA_GM_MEDIA_EXECUTOR_APPROVED: ${{ vars.TIANRA_GM_MEDIA_EXECUTOR_APPROVED }}
+          TIANRA_RELEASE_PUBLIC_KEY: ${{ vars.TIANRA_RELEASE_PUBLIC_KEY }}
+          ITCH_PUBLISH_TOKEN: ${{ secrets.ITCH_PUBLISH_TOKEN }}
+          TIANRA_SIGNING_KEY: ${{ secrets.TIANRA_SIGNING_KEY }}
+          TIANRA_DB_OWNER_TOKEN: ${{ secrets.TIANRA_DB_OWNER_TOKEN }}
+        run: |
+          python3 apps/server/tools/game_master_media.py \
+            --publication "$PUBLICATION" \
+            --source-revision "$SOURCE_REVISION"
