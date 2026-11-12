@@ -143,6 +143,11 @@ jobs:
       - name: Build only the CLI
         run: python3 .github/tools/ci.py build cli
 
+      - name: Verify native render output and errors
+        env:
+          TIANRA_CLI_BINARY: target/release/tianra-gm
+        run: python3 -m unittest discover -s .github/tests -p test_cli_render.py -v
+
       - name: Assemble the standalone archive
         env:
           SOURCE_SHA: ${{ needs.plan.outputs.source }}
