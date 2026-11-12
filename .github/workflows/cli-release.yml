@@ -1,0 +1,217 @@
+name: CLI release
+run-name: CLI ${{ inputs.source_sha || 'requested build' }}
+
+on:
+  push:
+    branches: [main]
+    paths: [requests/beta.json]
+
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full private main commit to publish
+        required: true
+        type: string
+
+      force:
+        description: Rebuild even when CLI inputs have not changed
+        default: false
+        type: boolean
+
+concurrency:
+  group: tianra-cli-publication
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: source
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source: ${{ steps.source.outputs.source }}
+      cli: ${{ steps.plan.outputs.cli }}
+
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Select the CLI source
+        id: source
+        working-directory: ${{ github.workspace }}
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 .github/tools/cli.py select
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ steps.source.outputs.source }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify private main ancestry
+        working-directory: ${{ github.workspace }}
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source }}
+        run: python3 .github/tools/request.py verify "$SOURCE_SHA"
+
+      - name: Find last delivered CLI source
+        id: baseline
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/tools/cli.py baseline
+
+      - name: Plan independent CLI inputs
+        id: plan
+        env:
+          BASE: ${{ steps.baseline.outputs.base }}
+          FORCE: ${{ inputs.force || false }}
+        run: python3 .github/tools/plan_cli.py --base "$BASE" --force "$FORCE"
+
+      - run: python3 -m unittest discover -s .github/tests -v
+
+      - run: python3 tools/audit_import.py --working-tree
+
+  cli:
+    needs: plan
+    if: needs.plan.outputs.cli == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      TIANRA_TARGET: macos-aarch64
+      TIANRA_BUILD: ${{ github.run_number }}
+      TIANRA_CLI_BUILD: ${{ github.run_number }}
+      TIANRA_RELEASE_PUBLIC_KEY: ${{ vars.TIANRA_RELEASE_PUBLIC_KEY }}
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      build: ${{ steps.publish.outputs.build }}
+      sha256: ${{ steps.publish.outputs.sha256 }}
+
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Check out private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/tianra
+          ref: ${{ needs.plan.outputs.source }}
+          path: source
+          ssh-key: ${{ secrets.TIANRA_SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - run: python3 .github/tools/ci_setup.py rust native
+
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: cache
+        with:
+          path: source/target
+          key: macos-aarch64-1.99.0-release-v4-${{ hashFiles('source/Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            macos-aarch64-1.99.0-release-v4-${{ hashFiles('source/Cargo.lock') }}-
+            macos-aarch64-1.99.0-release-v4-
+
+      - name: Verify generated discovery
+        run: python3 apps/server/tools/generate_cli_schema.py --check
+
+      - name: Test CLI and shared content behavior
+        run: cargo test --locked --release -p tianra-gm -p tianra-content -p tianra-protocol
+
+      - name: Build only the CLI
+        run: python3 .github/tools/ci.py build cli
+
+      - name: Assemble the standalone archive
+        env:
+          SOURCE_SHA: ${{ needs.plan.outputs.source }}
+        run: python3 .github/tools/package_cli.py package --build "$TIANRA_BUILD" --source "$SOURCE_SHA"
+
+      - name: Publish and verify exact hosted bytes
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source }}
+        run: python3 .github/tools/package_cli.py publish --build "$TIANRA_BUILD" --source "$SOURCE_SHA"
+
+      - name: Bound and sanitize the existing cache
+        id: prune
+        if: always() && !cancelled()
+        run: python3 "$GITHUB_WORKSPACE/.github/tools/cache.py" --mib 2048 --profile release
+
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && !cancelled() && steps.prune.outcome == 'success' && steps.prune.outputs.cache_ready == 'true' && steps.cache.outputs.cache-primary-key != '' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: source/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  homebrew:
+    needs: cli
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+        working-directory: tap
+    steps:
+      - name: Check out formula helper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          path: builds
+
+      - name: Check out the Homebrew tap
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gridness/homebrew-oosama
+          path: tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+
+      - name: Update the verified CLI formula
+        env:
+          CLI_VERSION: ${{ needs.cli.outputs.version }}
+          CLI_BUILD: ${{ needs.cli.outputs.build }}
+          CLI_SHA256: ${{ needs.cli.outputs.sha256 }}
+        run: python3 ../builds/.github/tools/tap.py
+
+      - name: Deliver the formula
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+
+          git commit -m 'Update tianra-gm'
+
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+
+            git pull --rebase origin main
+          done
+
+          exit 1
